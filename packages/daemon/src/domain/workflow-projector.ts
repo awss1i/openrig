@@ -1001,13 +1001,12 @@ export class WorkflowProjector {
 
     const mappedTarget = currentStep.next_hop?.on?.[input.exit];
     const completesPrerequisite = input.exit === "done" || input.exit === "handoff";
-    const trail = this.trailLog.listForInstance(instance.instanceId, 100_000);
-    // Trail rows come newest first, so a higher rank is a later done or handoff closure.
+    // Rank by append order, not closed_at, so a clock step-back cannot reorder completions.
+    // A higher rank is a later done or handoff closure.
+    const trail = this.trailLog.listForInstanceInAppendOrder(instance.instanceId);
     const latestCompletion = new Map<string, number>();
     trail.forEach((entry, index) => {
-      if ((entry.closureReason === "done" || entry.closureReason === "handoff") && !latestCompletion.has(entry.stepId)) {
-        latestCompletion.set(entry.stepId, trail.length - index);
-      }
+      if (entry.closureReason === "done" || entry.closureReason === "handoff") latestCompletion.set(entry.stepId, index + 1);
     });
     if (completesPrerequisite) latestCompletion.set(currentStep.id, trail.length + 1);
     // A completion older than a prerequisite's latest completion no longer counts, so a step

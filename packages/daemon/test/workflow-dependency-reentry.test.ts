@@ -41,10 +41,39 @@ const BUILD = `workflow:
       next_hop: {on: {failed: implement}}
 `;
 
+const STRAIGHT = `workflow:
+  id: straight-through
+  version: 1
+  entry: {role: owner}
+  roles:
+    owner: {preferred_targets: [owner@rig]}
+  exception_routing: {orchestrator_role: owner}
+  steps:
+    - id: a
+      actor_role: owner
+      depends_on: []
+      allowed_exits: [handoff]
+    - id: b
+      actor_role: owner
+      depends_on: [a]
+      allowed_exits: [handoff]
+    - id: c
+      actor_role: owner
+      depends_on: [b]
+      allowed_exits: [handoff]
+    - id: gate
+      actor_role: owner
+      depends_on: [b, c]
+      allowed_exits: [done]
+      gate: {target: human@host, summary: Sign-off, evidence_ref: proof/straight.md}
+`;
+
 describe("dependency graph re-entry through a routed exit", () => {
   let db: ReturnType<typeof createDb>;
   let runtime: WorkflowRuntime;
   let dir: string;
+  // Unset means real time. A test sets it to move the workflow clock by hand.
+  let clock: Date | undefined;
   beforeEach(() => {
     db = createDb(); migrate(db, ALL_MIGRATIONS);
     db.prepare("INSERT INTO rigs(id,name) VALUES('rig','rig')").run();
@@ -53,7 +82,8 @@ describe("dependency graph re-entry through a routed exit", () => {
       send: async () => ({ ok: false, reason: "controlled terminal is stopped" }),
     } });
     queue.attachOutbox(new OutboxHandler(db));
-    runtime = new WorkflowRuntime({ db, eventBus: bus, queueRepo: queue });
+    clock = undefined;
+    runtime = new WorkflowRuntime({ db, eventBus: bus, queueRepo: queue, now: () => clock ?? new Date() });
     dir = mkdtempSync(join(tmpdir(), "dependency-reentry-"));
   });
   afterEach(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
@@ -106,5 +136,21 @@ describe("dependency graph re-entry through a routed exit", () => {
     expect(shipped.nextStepIds).toEqual([]);
     expect(shipped.instance.status).toBe("completed");
     expect(runtime.trailLog.listForInstance(run.id)).toHaveLength(4);
+  });
+
+  it("opens the gate when the clock steps back in a run with no routed exit", async () => {
+    clock = new Date("2026-10-05T10:00:00.000Z");
+    const run = await start(STRAIGHT);
+    const afterA = await project(run.id, run.entry, "handoff");
+    expect(afterA.nextStepIds).toEqual(["b"]);
+
+    clock = new Date("2026-10-05T09:00:00.000Z");
+    const afterB = await project(run.id, packetFor(afterA, "b"), "handoff");
+    expect(afterB.nextStepIds).toEqual(["c"]);
+    clock = new Date("2026-10-05T09:00:01.000Z");
+    const afterC = await project(run.id, packetFor(afterB, "c"), "handoff");
+    expect(afterC.nextStepIds).toEqual(["gate"]);
+    expect(afterC.instance.status).toBe("waiting");
+    expect(afterC.emittedEventTypes).not.toContain("workflow.completed");
   });
 });
