@@ -3,7 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { reconcileSkillLoadout, resolveSkillLoadout } from "../src/domain/skill-catalog.js";
+import { reconcileSkillLoadout, resolvePluginSkills, resolveSkillLoadout, type SkillLoadout } from "../src/domain/skill-catalog.js";
 
 const roots: string[] = [];
 
@@ -573,5 +573,133 @@ describe("managed skill catalog and composable loadouts", () => {
     const refused = reconcileSkillLoadout({ loadout: empty.loadout, runtime: "codex", cwd: f.project, apply: true });
     expect(refused).toMatchObject({ ok: false, errors: [{ code: "ownership_manifest_invalid" }] });
     expect(readFileSync(join(external, "marker"), "utf8")).toBe("preserved\n");
+  });
+});
+
+describe("plugin skills in the managed loadout", () => {
+  function writePlugin(root: string, manifests: string[], skills: string[]): string {
+    const plugin = join(root, "plugins", "core");
+    for (const manifest of manifests) {
+      mkdirSync(join(plugin, manifest), { recursive: true });
+      writeFileSync(join(plugin, manifest, "plugin.json"), JSON.stringify({ name: "core", version: "1.2.3", skills: "./skills" }));
+    }
+    for (const id of skills) writeSkill(join(plugin, "skills"), id);
+    return plugin;
+  }
+
+  function loadoutOf(entries: SkillLoadout["entries"], root: string): SkillLoadout {
+    return { catalogRoot: join(root, "no-catalog"), catalogRevision: null, catalogDigest: null, projectSelectionDeclared: false, projectSelection: [], entries };
+  }
+
+  it("selects a plugin's skills only for the runtimes its manifests or plugin type name", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["queue-handoff", "delegating-work"]);
+
+    const claude = resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" });
+    expect(claude.warnings).toEqual([]);
+    expect(claude.entries.map((entry) => [entry.id, entry.selectedBy, entry.revision, entry.pluginId, entry.sourceDir])).toEqual([
+      ["delegating-work", ["topology"], "plugin:core@1.2.3", "core", join(plugin, "skills", "delegating-work")],
+      ["queue-handoff", ["topology"], "plugin:core@1.2.3", "core", join(plugin, "skills", "queue-handoff")],
+    ]);
+    expect(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "codex" }).entries).toEqual([]);
+    expect(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "codex", pluginType: "codex" }).entries.map((entry) => entry.id))
+      .toEqual(["delegating-work", "queue-handoff"]);
+    expect(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code", pluginType: "codex" }).entries).toEqual([]);
+  });
+
+  it("skips a plugin skill it cannot copy exactly and says why", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["good", "linked"]);
+    symlinkSync(join(plugin, "skills", "good", "SKILL.md"), join(plugin, "skills", "linked", "extra.md"));
+
+    const result = resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" });
+    expect(result.entries.map((entry) => entry.id)).toEqual(["good"]);
+    expect(result.warnings).toEqual([expect.stringMatching(/^plugin_skill_skipped: .*linked.*symlink/)]);
+  });
+
+  it.each([
+    ["claude-code", ".claude"],
+    ["codex", ".agents"],
+  ] as const)("projects a plugin's skills into the %s project skill folder and owns them", (runtime, harnessDir) => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin", ".codex-plugin"], ["queue-handoff", "delegating-work"]);
+    const loadout = loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime }).entries, f.root);
+
+    expect(reconcileSkillLoadout({ loadout, runtime, cwd: f.project, topologyOwner: "seat-a", apply: true }))
+      .toMatchObject({ ok: true, applied: true });
+    for (const id of ["queue-handoff", "delegating-work"]) {
+      expect(readFileSync(join(f.project, harnessDir, "skills", id, "SKILL.md"), "utf8"))
+        .toBe(readFileSync(join(plugin, "skills", id, "SKILL.md"), "utf8"));
+    }
+    const manifest = JSON.parse(readFileSync(join(f.project, ".openrig", "skill-loadouts", `${runtime}.json`), "utf8")) as {
+      skills: Array<{ id: string; revision: string }>;
+    };
+    expect(manifest.skills.map((skill) => [skill.id, skill.revision])).toEqual([
+      ["delegating-work", "plugin:core@1.2.3"],
+      ["queue-handoff", "plugin:core@1.2.3"],
+    ]);
+    expect(reconcileSkillLoadout({ loadout, runtime, cwd: f.project, topologyOwner: "seat-a", apply: true }))
+      .toMatchObject({ ok: true, applied: false });
+  });
+
+  it("keeps a same-name skill OpenRig does not own and records no ownership or selection for it", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".codex-plugin"], ["queue-handoff", "delegating-work"]);
+    const own = join(f.project, ".agents", "skills", "queue-handoff");
+    mkdirSync(own, { recursive: true });
+    writeFileSync(join(own, "SKILL.md"), "---\nname: queue-handoff\ndescription: The repository's own copy.\n---\n");
+    commit(f.root);
+    const loadout = loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "codex" }).entries, f.root);
+
+    const result = reconcileSkillLoadout({ loadout, runtime: "codex", cwd: f.project, topologyOwner: "seat-a", apply: true });
+    expect(result).toMatchObject({ ok: true, applied: true, errors: [] });
+    expect(readFileSync(join(own, "SKILL.md"), "utf8")).toContain("The repository's own copy.");
+    expect(git(f.root, "status", "--porcelain", "--untracked-files=no")).toBe("");
+    expect(result.receipts.find((receipt) => receipt.id === "queue-handoff")).toMatchObject({
+      status: "shadowed",
+      detail: expect.stringMatching(/^kept: .*does not own/),
+    });
+    expect(existsSync(join(f.project, ".agents", "skills", "delegating-work", "SKILL.md"))).toBe(true);
+    const manifest = JSON.parse(readFileSync(join(f.project, ".openrig", "skill-loadouts", "codex.json"), "utf8")) as {
+      skills: Array<{ id: string }>;
+      topologySelections: Record<string, string[]>;
+    };
+    expect(manifest.skills.map((skill) => skill.id)).toEqual(["delegating-work"]);
+    expect(manifest.topologySelections).toEqual({ "seat-a": ["delegating-work"] });
+
+    // A seat that shares this folder without the plugin is not blocked by the kept skill.
+    expect(reconcileSkillLoadout({ loadout: loadoutOf([], f.root), runtime: "codex", cwd: f.project, topologyOwner: "seat-b", apply: true }))
+      .toMatchObject({ ok: true, errors: [] });
+  });
+
+  it("refreshes its own copy when the plugin's skill changes", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["queue-handoff"]);
+    const resolve = () => loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" }).entries, f.root);
+    expect(reconcileSkillLoadout({ loadout: resolve(), runtime: "claude-code", cwd: f.project, apply: true }).ok).toBe(true);
+
+    writeSkill(join(plugin, "skills"), "queue-handoff", "queue-handoff", "# newer plugin bytes\n");
+    const refreshed = reconcileSkillLoadout({ loadout: resolve(), runtime: "claude-code", cwd: f.project, apply: true });
+    expect(refreshed).toMatchObject({ ok: true, applied: true });
+    expect(refreshed.receipts.find((receipt) => receipt.id === "queue-handoff")?.status).toBe("current");
+    expect(readFileSync(join(f.project, ".claude", "skills", "queue-handoff", "SKILL.md"), "utf8")).toContain("newer plugin bytes");
+  });
+
+  it("keeps an edit to its own plugin copy under the same ownership record", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["queue-handoff"]);
+    const resolve = () => loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" }).entries, f.root);
+    expect(reconcileSkillLoadout({ loadout: resolve(), runtime: "claude-code", cwd: f.project, apply: true }).ok).toBe(true);
+    const manifestPath = join(f.project, ".openrig", "skill-loadouts", "claude-code.json");
+    const ownedBefore = readFileSync(manifestPath, "utf8");
+    const target = join(f.project, ".claude", "skills", "queue-handoff", "SKILL.md");
+    writeFileSync(target, "operator edit\n");
+
+    writeSkill(join(plugin, "skills"), "queue-handoff", "queue-handoff", "# newer plugin bytes\n");
+    const kept = reconcileSkillLoadout({ loadout: resolve(), runtime: "claude-code", cwd: f.project, apply: true });
+    expect(kept).toMatchObject({ ok: true, errors: [] });
+    expect(kept.receipts[0]).toMatchObject({ id: "queue-handoff", status: "shadowed", detail: expect.stringMatching(/^kept: .*changed after OpenRig projected it/) });
+    expect(readFileSync(target, "utf8")).toBe("operator edit\n");
+    expect(JSON.parse(readFileSync(manifestPath, "utf8")).skills).toEqual(JSON.parse(ownedBefore).skills);
   });
 });
