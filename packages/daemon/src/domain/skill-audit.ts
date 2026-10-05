@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve, dirname } from "node:path";
 import { sha256Hex } from "./files/file-write-service.js";
 import type { SkillProvenanceEntry } from "./skill-discovery.js";
@@ -178,6 +178,9 @@ export function listBundledSkillSources(pluginsDir: string): BundledSkillSource[
   return sources;
 }
 
+/** Every file under dir, relative to it; dir itself may be a symlink. A symlinked directory inside it is
+ *  listed as an entry but never walked, so a link cycle (`a -> .`) can't run away, and a copy holding one
+ *  can't match a plugin's plain files. */
 function listFilesRecursive(dir: string, prefix = ""): string[] {
   let entries: string[];
   try { entries = readdirSync(dir).sort(); } catch { return []; }
@@ -186,8 +189,8 @@ function listFilesRecursive(dir: string, prefix = ""): string[] {
     const full = join(dir, entry);
     let stat;
     try { stat = statSync(full); } catch { continue; }
-    if (stat.isDirectory()) files.push(...listFilesRecursive(full, join(prefix, entry)));
-    else if (stat.isFile()) files.push(join(prefix, entry));
+    if (stat.isDirectory() && !lstatSync(full).isSymbolicLink()) files.push(...listFilesRecursive(full, join(prefix, entry)));
+    else if (stat.isDirectory() || stat.isFile()) files.push(join(prefix, entry));
   }
   return files;
 }

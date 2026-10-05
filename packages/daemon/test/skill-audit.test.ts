@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { auditSkills, listBundledSkillSources, type SkillAuditEntry } from "../src/domain/skill-audit.js";
@@ -533,6 +533,27 @@ describe("skill-audit — bundled plugin skills", () => {
     const { entries: [result] } = auditSkills([projectedEntry()], { bundledSources: listBundledSkillSources(pluginsDir) });
     expect(result!.bundledFrom).toBeNull();
     expect(result!.findings).toHaveLength(3);
+  });
+
+  it("a copy holding self-referencing directory symlinks completes and is audited like any other skill", () => {
+    writePlugin({ "SKILL.md": SKILL });
+    writeProjected({ "SKILL.md": SKILL, ".openrig-vendor-version": "0.1.4\n" });
+    symlinkSync(".", join(projected, "a"));
+    symlinkSync(".", join(projected, "b"));
+
+    const { entries: [result] } = auditSkills([projectedEntry()], { bundledSources: listBundledSkillSources(pluginsDir) });
+    expect(result!.bundledFrom).toBeNull();
+    expect(result!.findings).toHaveLength(3);
+  });
+
+  it("a copy that is itself a symlink to the plugin's skill directory still counts as bundled", () => {
+    writePlugin({ "SKILL.md": SKILL });
+    mkdirSync(join(projected, ".."), { recursive: true });
+    symlinkSync(join(pluginsDir, "openrig-core/skills/openrig-skills"), projected);
+
+    const { entries: [result] } = auditSkills([projectedEntry()], { bundledSources: listBundledSkillSources(pluginsDir) });
+    expect(result!.bundledFrom).toEqual({ plugin: "openrig-core", version: "0.1.4" });
+    expect(result!.findings).toEqual([]);
   });
 
   it("without bundled sources the projected copy is audited as before", () => {
