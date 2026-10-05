@@ -11,6 +11,7 @@ import {
   renameSync,
   rmSync,
   writeFileSync,
+  type Dirent,
 } from "node:fs";
 import nodePath from "node:path";
 import { parse as parseYaml } from "yaml";
@@ -394,7 +395,14 @@ export function resolvePluginSkills(input: {
   if (!isWithin(pluginRoot, skillsDir) || !existsSync(skillsDir)) return { entries, warnings };
   const revision = `plugin:${input.pluginId}${typeof manifest["version"] === "string" ? `@${manifest["version"]}` : ""}`;
 
-  for (const entry of readdirSync(skillsDir, { withFileTypes: true }).sort((a, b) => compareBytes(a.name, b.name))) {
+  let listing: Dirent[];
+  try {
+    listing = readdirSync(skillsDir, { withFileTypes: true });
+  } catch (err) {
+    warnings.push(`plugin_skill_skipped: plugin ${input.pluginId} skills at ${skillsDir}: ${(err as Error).message}`);
+    return { entries, warnings };
+  }
+  for (const entry of listing.sort((a, b) => compareBytes(a.name, b.name))) {
     if (!entry.isDirectory()) continue;
     const sourceDir = nodePath.join(skillsDir, entry.name);
     const skillFile = nodePath.join(sourceDir, "SKILL.md");
@@ -425,6 +433,11 @@ export function resolvePluginSkills(input: {
 }
 
 const KEPT_DETAIL = "kept: ";
+
+/** The plugin an owned record came from, from the revision resolvePluginSkills wrote. */
+function pluginIdOf(revision: string): string | undefined {
+  return /^plugin:([^@]+)/.exec(revision)?.[1];
+}
 
 /** A plugin skill left out because a skill OpenRig does not own already has its name. */
 export function isKeptPluginSkill(receipt: SkillProjectionReceipt): boolean {
@@ -756,10 +769,20 @@ export function reconcileSkillLoadout(input: {
   // A plugin's skill never displaces one OpenRig does not own: that target keeps its
   // bytes, and the selection is not recorded, so no seat sharing this folder later
   // depends on an ownership record that was never written.
+  // Names that differ only in ASCII letter case count as the same name, because Git may
+  // compare them that way (core.ignorecase) and an ignore entry would then hide the
+  // user's folder.
   const keptReceipts: SkillProjectionReceipt[] = [];
+  const foldCase = (name: string) => name.replace(/[A-Z]/g, (c) => c.toLowerCase());
+  let existingNames: string[] = [];
+  try { existingNames = readdirSync(targetRoot); } catch { /* no skill folder yet */ }
   const loadoutEntries = input.loadout.entries.filter((entry) => {
-    const target = nodePath.join(targetRoot, entry.id);
-    if (!entry.pluginId || owned.has(entry.id) || !pathEntryExists(target)) return true;
+    if (!entry.pluginId || owned.has(entry.id)) return true;
+    const existing = existingNames.includes(entry.id)
+      ? entry.id
+      : existingNames.find((name) => foldCase(name) === foldCase(entry.id));
+    if (existing === undefined) return true;
+    const target = nodePath.join(targetRoot, existing);
     const observed = classifySkillProjectionTarget(entry, undefined, target);
     keptReceipts.push({
       id: entry.id,
@@ -832,6 +855,7 @@ export function reconcileSkillLoadout(input: {
       });
       continue;
     }
+    const pluginId = pluginIdOf(prior.revision);
     effectiveEntries.push({
       id: prior.id,
       sourceDir: prior.sourceDir,
@@ -840,6 +864,7 @@ export function reconcileSkillLoadout(input: {
       digest: prior.digest,
       files: prior.files,
       selectedBy: ["topology"],
+      ...(pluginId ? { pluginId } : {}),
     });
   }
   const projectSelection = (input.loadout.projectSelectionDeclared
@@ -919,17 +944,36 @@ export function reconcileSkillLoadout(input: {
   for (const prior of manifest.skills) {
     if (selectedIds.has(prior.id)) continue;
     if (!pathEntryExists(prior.target)) continue;
+    let failure: SkillCatalogFailure | null = null;
     try {
-      const actual = inspectSkillDirectory(prior.target);
-      if (actual.digest === prior.digest) safeRemovals.push(prior);
-      else errors.push({
+      if (inspectSkillDirectory(prior.target).digest !== prior.digest) failure = {
         code: "stale_target_modified",
         message: `${prior.id}: deselected owned target was modified after projection; refusing to remove it`,
         path: prior.target,
-      });
+      };
     } catch (err) {
-      errors.push({ code: "stale_target_unreadable", message: `${prior.id}: ${(err as Error).message}`, path: prior.target });
+      failure = { code: "stale_target_unreadable", message: `${prior.id}: ${(err as Error).message}`, path: prior.target };
     }
+    if (!failure) {
+      safeRemovals.push(prior);
+      continue;
+    }
+    // A deselected plugin copy that was changed stays where it is and stops being OpenRig's.
+    const pluginId = pluginIdOf(prior.revision);
+    if (!pluginId) {
+      errors.push(failure);
+      continue;
+    }
+    receipts.push({
+      id: prior.id,
+      selectedBy: prior.selectedBy,
+      sourceRoot: prior.sourceRoot,
+      revision: prior.revision,
+      digest: prior.digest,
+      target: prior.target,
+      status: "shadowed",
+      detail: `${KEPT_DETAIL}plugin ${pluginId} is no longer selected and this copy differs from what OpenRig projected; left in place and no longer managed by OpenRig`,
+    });
   }
 
   if (errors.length > 0 || !input.apply) {

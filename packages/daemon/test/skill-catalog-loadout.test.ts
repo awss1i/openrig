@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -701,5 +701,83 @@ describe("plugin skills in the managed loadout", () => {
     expect(kept.receipts[0]).toMatchObject({ id: "queue-handoff", status: "shadowed", detail: expect.stringMatching(/^kept: .*changed after OpenRig projected it/) });
     expect(readFileSync(target, "utf8")).toBe("operator edit\n");
     expect(JSON.parse(readFileSync(manifestPath, "utf8")).skills).toEqual(JSON.parse(ownedBefore).skills);
+  });
+
+  it("keeps an edited plugin copy that another seat sharing the folder still selects", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".codex-plugin"], ["queue-handoff"]);
+    const loadout = loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "codex" }).entries, f.root);
+    expect(reconcileSkillLoadout({ loadout, runtime: "codex", cwd: f.project, topologyOwner: "seat-a", apply: true }).ok).toBe(true);
+    const target = join(f.project, ".agents", "skills", "queue-handoff", "SKILL.md");
+    writeFileSync(target, "operator edit\n");
+
+    const other = reconcileSkillLoadout({ loadout: loadoutOf([], f.root), runtime: "codex", cwd: f.project, topologyOwner: "seat-b", apply: true });
+    expect(other).toMatchObject({ ok: true, errors: [] });
+    expect(other.receipts[0]).toMatchObject({ id: "queue-handoff", status: "shadowed", detail: expect.stringMatching(/^kept: /) });
+    expect(readFileSync(target, "utf8")).toBe("operator edit\n");
+  });
+
+  it("leaves an edited plugin copy in place, no longer owned, when the plugin is deselected", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["queue-handoff", "delegating-work"]);
+    const loadout = loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" }).entries, f.root);
+    expect(reconcileSkillLoadout({ loadout, runtime: "claude-code", cwd: f.project, apply: true }).ok).toBe(true);
+    const edited = join(f.project, ".claude", "skills", "queue-handoff", "SKILL.md");
+    writeFileSync(edited, "operator edit\n");
+
+    const deselected = reconcileSkillLoadout({ loadout: loadoutOf([], f.root), runtime: "claude-code", cwd: f.project, apply: true });
+    expect(deselected).toMatchObject({ ok: true, applied: true, removed: ["delegating-work"], errors: [] });
+    expect(deselected.receipts.find((receipt) => receipt.id === "queue-handoff")).toMatchObject({ status: "shadowed", detail: expect.stringMatching(/^kept: /) });
+    expect(readFileSync(edited, "utf8")).toBe("operator edit\n");
+    expect(existsSync(join(f.project, ".claude", "skills", "delegating-work"))).toBe(false);
+    const manifest = JSON.parse(readFileSync(join(f.project, ".openrig", "skill-loadouts", "claude-code.json"), "utf8")) as { skills: unknown[] };
+    expect(manifest.skills).toEqual([]);
+  });
+
+  it("lets every seat sharing the folder keep launching after an edit to a plugin copy (review replay)", () => {
+    const f = fixture([]);
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["queue-handoff", "delegating-work"]);
+    const full = resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" }).entries;
+    const reconcile = (entries: SkillLoadout["entries"], owner: string) =>
+      reconcileSkillLoadout({ loadout: loadoutOf(entries, f.root), runtime: "claude-code", cwd: f.project, topologyOwner: owner, apply: true });
+    const edited = join(f.project, ".claude", "skills", "queue-handoff", "SKILL.md");
+
+    expect(reconcile(full, "dev-a")).toMatchObject({ ok: true, applied: true });
+    writeFileSync(edited, "operator edit\n");
+    // Seat B shares the folder and does not select the plugin.
+    expect(reconcile([], "dev-b")).toMatchObject({ ok: true, errors: [] });
+    // A plugin release drops the edited skill while seat A still selects the plugin.
+    expect(reconcile(full.filter((entry) => entry.id !== "queue-handoff"), "dev-a")).toMatchObject({ ok: true, errors: [] });
+    // Seat A deselects the plugin altogether.
+    expect(reconcile([], "dev-a")).toMatchObject({ ok: true, errors: [] });
+    expect(readFileSync(edited, "utf8")).toBe("operator edit\n");
+  });
+
+  it("treats a same-name skill in another letter case as the user's and adds no ignore entry for it", () => {
+    const f = fixture([]);
+    git(f.root, "config", "core.ignorecase", "true");
+    const plugin = writePlugin(f.root, [".claude-plugin"], ["queue-handoff"]);
+    const own = join(f.project, ".claude", "skills", "Queue-Handoff");
+    mkdirSync(own, { recursive: true });
+    writeFileSync(join(own, "SKILL.md"), "---\nname: Queue-Handoff\ndescription: The user's own.\n---\n");
+    const loadout = loadoutOf(resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" }).entries, f.root);
+
+    const result = reconcileSkillLoadout({ loadout, runtime: "claude-code", cwd: f.project, apply: true });
+    expect(result).toMatchObject({ ok: true, errors: [] });
+    expect(result.receipts).toEqual([expect.objectContaining({ id: "queue-handoff", status: "shadowed", target: own, detail: expect.stringMatching(/^kept: /) })]);
+    expect(readdirSync(join(f.project, ".claude", "skills"))).toEqual(["Queue-Handoff"]);
+    expect(git(f.root, "status", "--porcelain", "--untracked-files=all")).toContain("project/.claude/skills/Queue-Handoff/SKILL.md");
+  });
+
+  it("returns no plugin skills, with a warning, when the plugin's skills path is not a readable folder", () => {
+    const f = fixture([]);
+    const plugin = join(f.root, "plugins", "core");
+    mkdirSync(join(plugin, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(plugin, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "core", skills: "./skills.md" }));
+    writeFileSync(join(plugin, "skills.md"), "not a folder\n");
+
+    const result = resolvePluginSkills({ pluginId: "core", pluginRoot: plugin, runtime: "claude-code" });
+    expect(result.entries).toEqual([]);
+    expect(result.warnings).toEqual([expect.stringMatching(/^plugin_skill_skipped: plugin core skills at .*skills\.md/)]);
   });
 });
