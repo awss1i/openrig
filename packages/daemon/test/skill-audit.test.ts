@@ -526,6 +526,15 @@ describe("skill-audit — bundled plugin skills", () => {
     expect(result!.findings).toHaveLength(3);
   });
 
+  it("a copy with a file added locally is audited like any other skill", () => {
+    writePlugin({ "SKILL.md": SKILL });
+    writeProjected({ "SKILL.md": SKILL, ".openrig-vendor-version": "0.1.4\n", "references/local.md": "# local\n" });
+
+    const { entries: [result] } = auditSkills([projectedEntry()], { bundledSources: listBundledSkillSources(pluginsDir) });
+    expect(result!.bundledFrom).toBeNull();
+    expect(result!.findings).toHaveLength(3);
+  });
+
   it("without bundled sources the projected copy is audited as before", () => {
     writePlugin({ "SKILL.md": SKILL });
     writeProjected({ "SKILL.md": SKILL });

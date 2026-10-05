@@ -192,14 +192,18 @@ function listFilesRecursive(dir: string, prefix = ""): string[] {
   return files;
 }
 
-/** A copy is bundled when the same-named skill in an installed plugin exists and every file the plugin
- *  ships for it is present here with identical bytes. Extra files (the projection's version marker)
- *  don't count against it; an edited or missing file means the copy is audited like any other skill. */
+// The projection writes this marker beside the plugin's files (plugin-vendor-service GLOBAL_VENDOR_VERSION).
+const PROJECTION_MARKER = ".openrig-vendor-version";
+
+/** A copy is bundled when the same-named skill in an installed plugin exists, the copy holds exactly the
+ *  plugin's files (plus the projection's version marker), and every one has identical bytes. An edited,
+ *  added or missing file means the copy is audited like any other skill. */
 function matchBundledSource(skillPath: string, sources: BundledSkillSource[]): BundledSkillSource | null {
   for (const source of sources) {
     const pluginSkill = join(source.skillsDir, basename(skillPath));
     const files = listFilesRecursive(pluginSkill);
     if (!files.includes("SKILL.md")) continue;
+    if (listFilesRecursive(skillPath).some((rel) => rel !== PROJECTION_MARKER && !files.includes(rel))) continue;
     const identical = files.every((rel) => {
       try { return readFileSync(join(pluginSkill, rel)).equals(readFileSync(join(skillPath, rel))); }
       catch { return false; }
